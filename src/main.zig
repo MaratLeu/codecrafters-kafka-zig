@@ -2,11 +2,31 @@ const std = @import("std");
 const net = std.net;
 const posix = std.posix;
 
-const HeaderV0 = packed struct {correlation_id: u32};
+const HeaderV0 = packed struct {
+    request_api_key: i16,
+    request_api_version: i16,
+    correlation_id: i32,
+};
 
 const ResponseMessage = packed struct {
     message_size: i32,
+    correlation_id: i32 
+};
+
+const RequestMessage = packed struct {
+    message_size: i32,
     headers: HeaderV0,
+
+    fn parse(reader: anytype) !RequestMessage {
+        return RequestMessage {
+            .message_size = try reader.readInt(i32, .big),
+            .headers = HeaderV0 {
+                .request_api_key = try reader.readInt(i16, .big),
+                .request_api_version = try reader.readInt(i16, .big),
+                .correlation_id = try reader.readInt(i32, .big),
+            } 
+        };
+    }
 };
 
 pub fn main() !void {
@@ -32,12 +52,14 @@ pub fn main() !void {
     
     var buffer: [1024]u8 = undefined;
     _ = try posix.read(client_socket, buffer[0..]);
-    
+   
+    var stream_ = std.io.fixedBufferStream(buffer[0..]);
+    const reader = stream_.reader();
+    const request = try RequestMessage.parse(reader);
+
     const response = ResponseMessage {
-        .message_size = 0,
-        .headers = .{
-            .correlation_id = 7
-        }
+        .message_size = request.message_size,
+        .correlation_id = request.headers.correlation_id,
     };
     
     try writer.writeStructEndian(response, .big);
