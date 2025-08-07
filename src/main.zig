@@ -10,7 +10,8 @@ const HeaderV0 = packed struct {
 
 const ResponseMessage = packed struct {
     message_size: i32,
-    correlation_id: i32 
+    headers: i32, 
+    error_code: i16,
 };
 
 const RequestMessage = packed struct {
@@ -28,6 +29,10 @@ const RequestMessage = packed struct {
         };
     }
 };
+
+fn is_valid_api_version(api_version: i16) bool {
+    return api_version >= 0 and api_version <= 4;
+}
 
 pub fn main() !void {
     const sock_fd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
@@ -57,9 +62,11 @@ pub fn main() !void {
     const reader = stream_.reader();
     const request = try RequestMessage.parse(reader);
 
+    const is_valid_version = is_valid_api_version(request.headers.request_api_version);
     const response = ResponseMessage {
         .message_size = request.message_size,
-        .correlation_id = request.headers.correlation_id,
+        .headers = request.headers.correlation_id,
+        .error_code = if (is_valid_version) 0 else 35,
     };
     
     try writer.writeStructEndian(response, .big);
