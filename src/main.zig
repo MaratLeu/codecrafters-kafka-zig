@@ -2,36 +2,160 @@ const std = @import("std");
 const net = std.net;
 const posix = std.posix;
 
-const HeaderV0 = packed struct {
-    request_api_key: i16,
-    request_api_version: i16,
-    correlation_id: i32,
+const APIVersion = packed struct {
+    api_key: u16,
+    min_supported_apiversion: u16,
+    max_supported_apiversion: u16,
+    tag_buffer: u8 = 0x00,
 };
 
-const ResponseMessage = packed struct {
-    message_size: i32,
-    headers: i32, 
-    error_code: i16,
+const APIVersionsArray = packed struct {
+    array_length: u8,
+    version_1: APIVersion,
+    version_2: APIVersion, 
+    version_3: APIVersion,
 };
 
-const RequestMessage = packed struct {
-    message_size: i32,
+const ResponseBody = packed struct {
+    error_code: u16,
+    versions_array: APIVersionsArray,
+    throttle_time: u32,
+    tag_buffer: u8 = 0x00,
+};
+
+const APIVersionsResponse = packed struct {
+    message_size: u32,
+    headers: u32, 
+    body: ResponseBody,
+};
+
+const CLIENT_ID = struct {
+    length: u16,
+    contents_ptr: []u8,
+};
+
+const HeaderV0 = struct {
+    request_api_key: u16,
+    request_api_version: u16,
+    correlation_id: u32,
+    client_id: CLIENT_ID,
+    tag_buffer: u8 = 0x00,
+};
+
+const CompactString = struct {
+    length: u8,
+    contents_ptr: []u8,
+};
+
+const RequestBody = struct {
+    client_id: CompactString,
+    client_software_version: CompactString,
+    tag_buffer: u8 = 0x00,
+};
+
+const APIVersionsRequest = struct {
+    message_size: u32,
     headers: HeaderV0,
+    body: RequestBody,
 
-    fn parse(reader: anytype) !RequestMessage {
-        return RequestMessage {
-            .message_size = try reader.readInt(i32, .big),
-            .headers = HeaderV0 {
-                .request_api_key = try reader.readInt(i16, .big),
-                .request_api_version = try reader.readInt(i16, .big),
-                .correlation_id = try reader.readInt(i32, .big),
-            } 
+    fn parse_request (reader: anytype) !APIVersionsRequest {
+        const mess_size = try reader.readInt(u32, .big);
+        
+        //parse headers
+        const api_key = try reader.readInt(u16, .big);
+        const api_version = try reader.readInt(u16, .big);
+        const corr_id = try reader.readInt(u32, .big);
+        
+        const head_client_id_length = try reader.readInt(u16, .big);
+        const head_client_id_bytes = try std.heap.page_allocator.alloc(u8, head_client_id_length); 
+        _ = try reader.readAtLeast(head_client_id_bytes, head_client_id_length);
+
+        const headers_client_id = CLIENT_ID {
+            .length = head_client_id_length,
+            .contents_ptr = head_client_id_bytes,
         };
+
+        const head_tag = try reader.readByte();
+
+        const headers_ = HeaderV0 {
+            .request_api_key = api_key,
+            .request_api_version = api_version,
+            .correlation_id = corr_id,
+            .client_id = headers_client_id, 
+            .tag_buffer = head_tag,
+        };
+
+        // parse body
+        const body_client_id_length = try reader.readByte();
+        const body_client_id_bytes = try std.heap.page_allocator.alloc(u8, body_client_id_length - 1);
+        _ = try reader.readAtLeast(body_client_id_bytes, body_client_id_length - 1);
+
+        const body_client_id = CompactString {
+            .length = body_client_id_length,
+            .contents_ptr = body_client_id_bytes,
+        };
+
+        const body_client_softversion = try reader.readByte();
+        const body_client_softversion_bytes = try std.heap.page_allocator.alloc(u8, body_client_softversion - 1);
+        _ = try reader.readAtLeast(body_client_softversion_bytes, body_client_softversion - 1);
+
+        const body_softversion = CompactString {
+            .length = body_client_softversion,
+            .contents_ptr = body_client_softversion_bytes,
+        };
+
+        const body_tag = try reader.readByte();
+
+        const body_ = RequestBody {
+            .client_id = body_client_id,
+            .client_software_version = body_softversion,
+            .tag_buffer = body_tag,
+        };
+
+        return APIVersionsRequest {
+            .message_size = mess_size,
+            .headers = headers_,
+            .body = body_,     
+        };     
     }
 };
 
-fn is_valid_api_version(api_version: i16) bool {
+fn is_valid_api_version(api_version: u16) bool {
     return api_version >= 0 and api_version <= 4;
+}
+
+fn writeResponse(writer: anytype, response: APIVersionsResponse) !void {
+    // Write message_size (u32)
+    try writer.writeInt(u32, response.message_size, .big);
+
+    // Write correlation_id (u32)
+    try writer.writeInt(u32, response.headers, .big);
+
+    // Write error_code (u16)
+    try writer.writeInt(u16, response.body.error_code, .big);
+
+    // Write array_length (u8)
+    try writer.writeByte(response.body.versions_array.array_length);
+
+    // Write each APIVersion
+    const versions = [_]APIVersion{
+        response.body.versions_array.version_1,
+        response.body.versions_array.version_2,
+        response.body.versions_array.version_3,
+    };
+
+    for (versions) |version| {
+        try writer.writeInt(u16, version.api_key, .big);
+        try writer.writeInt(u16, version.min_supported_apiversion, .big);
+        try writer.writeInt(u16, version.max_supported_apiversion, .big);
+        try writer.writeByte(version.tag_buffer);
+    }
+
+    // Write throttle_time (u32)
+    try writer.writeInt(u32, response.body.throttle_time, .big);
+
+    // Write tag_buffer (u8)
+    try writer.writeByte(response.body.tag_buffer);
 }
 
 pub fn main() !void {
@@ -60,14 +184,41 @@ pub fn main() !void {
    
     var stream_ = std.io.fixedBufferStream(buffer[0..]);
     const reader = stream_.reader();
-    const request = try RequestMessage.parse(reader);
+    const request = try APIVersionsRequest.parse_request(reader);
+
 
     const is_valid_version = is_valid_api_version(request.headers.request_api_version);
-    const response = ResponseMessage {
-        .message_size = request.message_size,
+    const response = APIVersionsResponse {
+        .message_size = (@bitSizeOf(APIVersionsResponse) >> 3) - @sizeOf(u32),
         .headers = request.headers.correlation_id,
-        .error_code = if (is_valid_version) 0 else 35,
+        .body = ResponseBody {
+            .error_code = if (is_valid_version) 0 else 35,
+            .versions_array = APIVersionsArray {
+                .array_length = 4,
+                .version_1 = APIVersion {
+                    .api_key = 1,
+                    .min_supported_apiversion = 0,
+                    .max_supported_apiversion = 17,
+                    .tag_buffer = 0x00,
+                },
+                .version_2 = APIVersion {
+                    .api_key = 18,
+                    .min_supported_apiversion = 0,
+                    .max_supported_apiversion = 4,
+                    .tag_buffer = 0x00,
+                },
+                .version_3 = APIVersion {
+                    .api_key = 75,
+                    .min_supported_apiversion = 0,
+                    .max_supported_apiversion = 0,
+                    .tag_buffer = 0x00,
+                }
+            },
+            .throttle_time = 768,
+            .tag_buffer = 0x00
+        },
     };
     
-    try writer.writeStructEndian(response, .big);
+   //try writer.writeStructEndian(response, .big);
+    try writeResponse(writer, response);
 }
