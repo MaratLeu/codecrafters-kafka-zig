@@ -179,6 +179,7 @@ pub fn main() !void {
     const stream = std.net.Stream {.handle = client_socket}; 
     const writer = stream.writer();
     
+    while (true) { 
     var buffer: [1024]u8 = undefined;
     _ = try posix.read(client_socket, buffer[0..]);
    
@@ -221,4 +222,5 @@ pub fn main() !void {
     
    //try writer.writeStructEndian(response, .big);
     try writeResponse(writer, response);
+    }
 }
