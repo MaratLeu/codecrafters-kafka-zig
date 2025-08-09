@@ -1,6 +1,7 @@
 const std = @import("std");
-const net = std.net;
 const posix = std.posix;
+const net = std.net;
+const Thread = std.Thread;
 
 const APIVersion = packed struct {
     api_key: u16,
@@ -158,6 +159,63 @@ fn writeResponse(writer: anytype, response: APIVersionsResponse) !void {
     try writer.writeByte(response.body.tag_buffer);
 }
 
+fn Context(comptime WriterType: type) type {
+    return struct {
+        socket: net.Stream,
+        writer: WriterType,
+
+        pub fn respond(self: *@This(), msg: []const u8) !void {
+            try self.writer.writeAll(msg);
+        }
+    };
+}
+
+fn listen_client(comptime WriterType: type, ctx: Context(WriterType)) !void {
+    defer ctx.socket.close();
+
+    while (true) {
+        var buffer: [1024]u8 = undefined;
+
+        const bytes_read = posix.read(ctx.socket.handle, buffer[0..]) catch |err| {
+            std.debug.print("Read error: {}\n", .{err});
+            break;
+        };
+
+        if (bytes_read == 0) {
+            std.debug.print("Client disconnected\n", .{});
+            break;
+        }
+
+        var stream_ = std.io.fixedBufferStream(buffer[0..bytes_read]);
+        const reader = stream_.reader();
+
+        const request = APIVersionsRequest.parse_request(reader) catch |err| {
+            std.debug.print("Parse error: {}\n", .{err});
+            break;
+        };
+
+        const is_valid_version = is_valid_api_version(request.headers.request_api_version);
+
+        const response = APIVersionsResponse {
+            .message_size = (@bitSizeOf(APIVersionsResponse) >> 3) - @sizeOf(u32),
+            .headers = request.headers.correlation_id,
+            .body = ResponseBody {
+                .error_code = if (is_valid_version) 0 else 35,
+                .versions_array = APIVersionsArray {
+                    .array_length = 4,
+                    .version_1 = APIVersion { .api_key = 1, .min_supported_apiversion = 0, .max_supported_apiversion = 17, .tag_buffer = 0x00 },
+                    .version_2 = APIVersion { .api_key = 18, .min_supported_apiversion = 0, .max_supported_apiversion = 4, .tag_buffer = 0x00 },
+                    .version_3 = APIVersion { .api_key = 75, .min_supported_apiversion = 0, .max_supported_apiversion = 0, .tag_buffer = 0x00 },
+                },
+                .throttle_time = 768,
+                .tag_buffer = 0x00,
+            },
+        };
+
+        try writeResponse(ctx.writer, response);
+    }
+}
+
 pub fn main() !void {
     const sock_fd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
     defer posix.close(sock_fd);
@@ -166,61 +224,36 @@ pub fn main() !void {
     const c: c_int = 1;
     try posix.setsockopt(sock_fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, std.mem.asBytes(&c));
     try posix.bind(sock_fd, &addr.any, addr.getOsSockLen());
-    try posix.listen(sock_fd, 1);
+    try posix.listen(sock_fd, 128);
 
-    // You can use print statements as follows for debugging, they'll be visible when running tests.
-    std.debug.print("Logs from your program will appear here!\n", .{});
+    std.debug.print("Server listening on 127.0.0.1:9092\n", .{});
 
-    var client_addr: posix.sockaddr = undefined;
-    var client_addr_len: posix.socklen_t = @sizeOf(posix.sockaddr);
-    const client_socket = try posix.accept(sock_fd, &client_addr, &client_addr_len, posix.SOCK.CLOEXEC);
-    defer posix.close(client_socket); 
+    while (true) {
+        var client_addr: posix.sockaddr = undefined;
+        var client_addr_len: posix.socklen_t = @sizeOf(posix.sockaddr);
 
-    const stream = std.net.Stream {.handle = client_socket}; 
-    const writer = stream.writer();
-    
-    while (true) { 
-    var buffer: [1024]u8 = undefined;
-    _ = try posix.read(client_socket, buffer[0..]);
-   
-    var stream_ = std.io.fixedBufferStream(buffer[0..]);
-    const reader = stream_.reader();
-    const request = try APIVersionsRequest.parse_request(reader);
+        const client_fd = posix.accept(sock_fd, &client_addr, &client_addr_len, posix.SOCK.CLOEXEC) catch |err| {
+            std.debug.print("Accept error: {}\n", .{err});
+            continue;
+        };
 
+        const stream = net.Stream { .handle = client_fd };
+        const writer = stream.writer();
 
-    const is_valid_version = is_valid_api_version(request.headers.request_api_version);
-    const response = APIVersionsResponse {
-        .message_size = (@bitSizeOf(APIVersionsResponse) >> 3) - @sizeOf(u32),
-        .headers = request.headers.correlation_id,
-        .body = ResponseBody {
-            .error_code = if (is_valid_version) 0 else 35,
-            .versions_array = APIVersionsArray {
-                .array_length = 4,
-                .version_1 = APIVersion {
-                    .api_key = 1,
-                    .min_supported_apiversion = 0,
-                    .max_supported_apiversion = 17,
-                    .tag_buffer = 0x00,
-                },
-                .version_2 = APIVersion {
-                    .api_key = 18,
-                    .min_supported_apiversion = 0,
-                    .max_supported_apiversion = 4,
-                    .tag_buffer = 0x00,
-                },
-                .version_3 = APIVersion {
-                    .api_key = 75,
-                    .min_supported_apiversion = 0,
-                    .max_supported_apiversion = 0,
-                    .tag_buffer = 0x00,
-                }
-            },
-            .throttle_time = 768,
-            .tag_buffer = 0x00
-        },
-    };
-    
-   //try writer.writeStructEndian(response, .big);
-    try writeResponse(writer, response);
+        const WriterType = @TypeOf(writer);
+        const ContextType = Context(WriterType);
+
+        const ctx = ContextType {
+            .socket = stream,
+            .writer = writer,
+        };
+
+        const thread = Thread.spawn(.{}, listen_client, .{WriterType, ctx}) catch |err| {
+            std.debug.print("Thread spawn error: {}\n", .{err});
+            stream.close();
+            continue;
+        };
+
+        thread.detach();
     }
 }
